@@ -7,6 +7,9 @@
 
 ## Unreleased: mitmproxy next
 
+- Add SOCKS5 UDP support: mitmproxy now handles the `UDP ASSOCIATE` command and relays
+  UDP datagrams, capturing them as regular UDP flows.
+  ([#8275](https://github.com/mitmproxy/mitmproxy/pull/8275), @pedro-cs-ribeiro)
 - Expand `~` in the `hardump` option, like other file path options. Previously, the HAR file
   could not be written on exit and the collected flows were lost.
   ([#8541](https://github.com/mitmproxy/mitmproxy/pull/8541), @memx13)
