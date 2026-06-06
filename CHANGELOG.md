@@ -7,6 +7,10 @@
 
 ## Unreleased: mitmproxy next
 
+- Add SOCKS5 UDP support: mitmproxy now handles the `UDP ASSOCIATE` command and relays
+  UDP datagrams, capturing them as regular UDP flows.
+  ([#8275](https://github.com/mitmproxy/mitmproxy/pull/8275), @pedro-cs-ribeiro)
+
 - Fix filter expressions where a filter without an argument is followed by a closing bracket,
   e.g. `!(~s)` or `(~q & ~s)`, which were rejected as invalid.
   ([#8537](https://github.com/mitmproxy/mitmproxy/pull/8537), @qodelicious)
