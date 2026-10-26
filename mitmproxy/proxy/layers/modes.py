@@ -108,6 +108,7 @@ SOCKS5_METHOD_NO_ACCEPTABLE_METHODS = 0xFF
 SOCKS5_CMD_CONNECT = 0x01
 SOCKS5_CMD_BIND = 0x02
 SOCKS5_CMD_UDP_ASSOCIATE = 0x03
+SOCKS5_CMD_FWD_UDP = 0x05
 
 SOCKS5_ATYP_IPV4_ADDRESS = 0x01
 SOCKS5_ATYP_DOMAINNAME = 0x03
@@ -313,7 +314,7 @@ class Socks5Proxy(DestinationKnown):
             return
 
         cmd = self.buf[1]
-        supported_cmds = (SOCKS5_CMD_CONNECT, SOCKS5_CMD_UDP_ASSOCIATE)
+        supported_cmds = (SOCKS5_CMD_CONNECT, SOCKS5_CMD_UDP_ASSOCIATE, SOCKS5_CMD_FWD_UDP)
         if (
             self.buf[0] != SOCKS5_VERSION
             or self.buf[2] != 0x00
@@ -338,6 +339,9 @@ class Socks5Proxy(DestinationKnown):
         if cmd == SOCKS5_CMD_UDP_ASSOCIATE:
             yield from self.start_udp_associate()
             return
+        if cmd == SOCKS5_CMD_FWD_UDP:
+            yield from self.start_fwd_udp()
+            return
 
         # CONNECT: We now have all we need, let's get going.
         self.context.server.address = (host, port)
@@ -360,6 +364,20 @@ class Socks5Proxy(DestinationKnown):
                     events.DataReceived(self.context.client, self.buf)
                 )
                 del self.buf
+
+    def start_fwd_udp(self) -> layer.CommandGenerator[None]:
+        # HEV's command 0x05 keeps UDP frames on the SOCKS TCP control channel.
+        yield commands.SendData(
+            self.context.client,
+            bytes([SOCKS5_VERSION, SOCKS5_REP_SUCCEEDED, 0x00])
+            + pack_socks5_address("0.0.0.0", 0),
+        )
+        relay = HevUdpInTcpProxy(self.context)
+        self._handle_event = relay.handle_event  # type: ignore
+        yield from relay.handle_event(events.Start())
+        if self.buf:
+            yield from relay.handle_event(events.DataReceived(self.context.client, self.buf))
+            self.buf = b""
 
     def start_udp_associate(self) -> layer.CommandGenerator[None]:
         # Point the client at our UDP relay, which shares this connection's address:port.
@@ -529,3 +547,58 @@ class Socks5UdpProxy(layer.Layer):
 
     def done(self, _) -> layer.CommandGenerator[None]:  # pragma: no cover
         yield from ()
+
+
+class HevUdpInTcpProxy(Socks5UdpProxy):
+    """HEV FWD UDP (0x05): length-prefixed datagrams on SOCKS TCP.
+
+    HEV: MSGLEN (2, network byte order), HDRLEN (1), ATYP, ADDR, PORT, DATA.
+    MSGLEN includes the two length bytes. HDRLEN includes the entire header.
+    """
+
+    def __init__(self, context: Context) -> None:
+        super().__init__(context)
+        self.tcp_buffer = bytearray()
+
+    def _handle_event(self, event: events.Event) -> layer.CommandGenerator[None]:
+        if isinstance(event, events.DataReceived) and event.connection is self.context.client:
+            self.tcp_buffer.extend(event.data)
+            while len(self.tcp_buffer) >= 2:
+                size = struct.unpack_from("!H", self.tcp_buffer)[0]
+                if size < 6 or size > 65535:
+                    yield commands.CloseConnection(self.context.client)
+                    return
+                if len(self.tcp_buffer) < size:
+                    return
+                frame = bytes(self.tcp_buffer[:size])
+                del self.tcp_buffer[:size]
+                hdrlen = frame[2]
+                if hdrlen < 6 or hdrlen > size:
+                    yield commands.CloseConnection(self.context.client)
+                    return
+                # Convert HEV header into standard SOCKS5 UDP datagram header.
+                yield from self.handle_datagram(b"\x00\x00\x00" + frame[3:])
+        else:
+            yield from super()._handle_event(event)
+
+    def event_to_child(self, stream: layer.Layer, event: events.Event) -> layer.CommandGenerator[None]:
+        for command in super().event_to_child(stream, event):
+            if isinstance(command, commands.SendData) and command.connection is self.context.client:
+                data = command.data
+                # Strip SOCKS5 UDP RSV(2), FRAG(1); keep ATYP,ADDR,PORT.
+                if len(data) < 4:
+                    continue
+                parsed = parse_socks5_address(data, 3)
+                if parsed is None:
+                    continue
+                _, _, offset = parsed
+                hdrlen = offset
+                total = len(data) - 3 + 3  # MSGLEN(2) + HDRLEN(1) + address + payload
+                if total > 65535:
+                    continue
+                yield commands.SendData(
+                    self.context.client,
+                    struct.pack("!HB", total, hdrlen) + data[3:],
+                )
+            else:
+                yield command
